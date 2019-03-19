@@ -19,7 +19,9 @@ namespace FASTER.core
     /// user defines the customized interface and provides it to FASTER
     /// so it can return a (generated) instance for that interface.
     /// </summary>
-    public unsafe interface IFasterKV<Key, Value, Input, Output, Context> : IDisposable
+    public interface IFasterKV<Key, Value, Input, Output, Context> : IDisposable
+        where Key : new()
+        where Value : new()
     {
         /* Thread-related operations */
 
@@ -89,11 +91,6 @@ namespace FASTER.core
         /// <returns>Whether all pending operations have completed</returns>
         bool CompletePending(bool wait);
 
-        /// <summary>
-        /// Truncate the log until, but not including, untilAddress
-        /// </summary>
-        /// <param name="untilAddress">Address to shift until</param>
-        bool ShiftBeginAddress(long untilAddress);
 
         /* Recovery */
 
@@ -117,6 +114,11 @@ namespace FASTER.core
         /// <param name="token">Token describing checkpoin</param>
         /// <returns>Whether checkpoint was initiated</returns>
         bool TakeHybridLogCheckpoint(out Guid token);
+
+        /// <summary>
+        /// Recover from last successfuly checkpoints
+        /// </summary>
+        void Recover();
 
         /// <summary>
         /// Recover using full checkpoint token
@@ -144,17 +146,6 @@ namespace FASTER.core
         /// <returns></returns>
         bool GrowIndex();
 
-        /* Statistics */
-        /// <summary>
-        /// Get tail address of FASTER log
-        /// </summary>
-        long LogTailAddress { get; }
-
-        /// <summary>
-        /// Get (safe) read-only address of FASTER
-        /// </summary>
-        long LogReadOnlyAddress { get; }
-
         /// <summary>
         /// Get number of (non-zero) hash entries in FASTER
         /// </summary>
@@ -164,5 +155,15 @@ namespace FASTER.core
         /// Dump distribution of #entries in hash table, to console
         /// </summary>
         void DumpDistribution();
+
+        /// <summary>
+        /// Get accessor for FASTER hybrid log
+        /// </summary>
+        LogAccessor<Key, Value, Input, Output, Context> Log { get; }
+
+        /// <summary>
+        /// Get accessor for FASTER read cache
+        /// </summary>
+        LogAccessor<Key, Value, Input, Output, Context> ReadCache { get; }
     }
 }

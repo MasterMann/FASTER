@@ -64,25 +64,6 @@ namespace FASTER.core
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private bool InternalShiftBeginAddress(long untilAddress)
-        {
-            if (_systemState.phase == Phase.REST)
-            {
-                var version = _systemState.version;
-
-                SystemState nextState = SystemState.Make(Phase.GC, version);
-                long oldBeginAddress = untilAddress;
-                if (GlobalMoveToNextState(SystemState.Make(Phase.REST, version), nextState, ref oldBeginAddress))
-                {
-                    hlog.ShiftBeginAddress(oldBeginAddress, untilAddress);
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool InternalGrowIndex()
         {
             if (_systemState.phase == Phase.GC)
@@ -199,6 +180,10 @@ namespace FASTER.core
                         }
                     case Phase.INDEX_CHECKPOINT:
                         {
+                            if (UseReadCache)
+                            {
+                                throw new Exception("Index checkpoint with read cache is not supported");
+                            }
                             TakeIndexFuzzyCheckpoint();
 
                             MakeTransition(intermediateState, nextState);
@@ -218,6 +203,10 @@ namespace FASTER.core
                                     }
                                 case Phase.PREP_INDEX_CHECKPOINT:
                                     {
+                                        if (UseReadCache)
+                                        {
+                                            throw new Exception("Index checkpoint with read cache is not supported");
+                                        }
                                         TakeIndexFuzzyCheckpoint();
                                         break;
                                     }
@@ -259,6 +248,7 @@ namespace FASTER.core
                                 _indexCheckpoint.info.num_buckets = overflowBucketsAllocator.GetMaxValidAddress();
                                 ObtainCurrentTailAddress(ref _indexCheckpoint.info.finalLogicalAddress);
                                 WriteIndexMetaFile();
+                                WriteIndexCheckpointCompleteFile();
                             }
 
                             if (FoldOverSnapshot)
@@ -273,8 +263,8 @@ namespace FASTER.core
 
                                 _hybridLogCheckpoint.snapshotFileDevice = Devices.CreateLogDevice
                                     (directoryConfiguration.GetHybridLogCheckpointFileName(_hybridLogCheckpointToken), false);
-                                _hybridLogCheckpoint.snapshotFileObjectLogDevice = Devices.CreateObjectLogDevice
-                                    (directoryConfiguration.GetHybridLogCheckpointFileName(_hybridLogCheckpointToken), false);
+                                _hybridLogCheckpoint.snapshotFileObjectLogDevice = Devices.CreateLogDevice
+                                    (directoryConfiguration.GetHybridLogObjectCheckpointFileName(_hybridLogCheckpointToken), false);
                                 _hybridLogCheckpoint.snapshotFileDevice.Initialize(hlog.GetSegmentSize());
                                 _hybridLogCheckpoint.snapshotFileObjectLogDevice.Initialize(hlog.GetSegmentSize());
 
@@ -295,21 +285,20 @@ namespace FASTER.core
                                                                 out _hybridLogCheckpoint.flushed);
                             }
 
-                            WriteHybridLogMetaInfo();
-
+                            
                             MakeTransition(intermediateState, nextState);
                             break;
                         }
                     case Phase.PERSISTENCE_CALLBACK:
                         {
+                            WriteHybridLogMetaInfo();
+                            WriteHybridLogCheckpointCompleteFile();
                             MakeTransition(intermediateState, nextState);
                             break;
                         }
                     case Phase.GC:
                         {
-                            var tmp = hlog.BeginAddress;
-                            hlog.BeginAddress = context;
-                            context = tmp;
+                            hlog.ShiftBeginAddress(context);
 
                             int numChunks = (int)(state[resizeInfo.version].size / Constants.kSizeofChunk);
                             if (numChunks == 0) numChunks = 1; // at least one chunk
@@ -356,6 +345,7 @@ namespace FASTER.core
                                         _indexCheckpoint.info.num_buckets = overflowBucketsAllocator.GetMaxValidAddress();
                                         ObtainCurrentTailAddress(ref _indexCheckpoint.info.finalLogicalAddress);
                                         WriteIndexMetaFile();
+                                        WriteIndexCheckpointCompleteFile();
                                         _indexCheckpoint.Reset();
                                         break;
                                     }
@@ -616,6 +606,25 @@ namespace FASTER.core
             }
         }
 
+        /*
+         * We have several state machines supported by this function.
+         * Full Checkpoint:
+         * REST -> PREP_INDEX_CHECKPOINT -> PREPARE -> IN_PROGRESS 
+         *      -> WAIT_PENDING -> WAIT_FLUSH -> PERSISTENCE_CALLBACK -> REST
+         * 
+         * Index Checkpoint:
+         * REST -> PREP_INDEX_CHECKPOINT -> INDEX_CHECKPOINT -> REST
+         * 
+         * Hybrid Log Checkpoint:
+         * REST -> PREPARE -> IN_PROGRESS -> WAIT_PENDING -> WAIT_FLUSH ->
+         *      -> PERSISTENCE_CALLBACK -> REST
+         *      
+         * Grow :
+         * REST -> PREPARE_GROW -> IN_PROGRESS_GROW -> REST
+         * 
+         * GC: 
+         * REST -> GC -> REST
+         */ 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private SystemState GetNextState(SystemState start, CheckpointType type = CheckpointType.FULL)
         {
@@ -648,7 +657,15 @@ namespace FASTER.core
                     }
                     break;
                 case Phase.INDEX_CHECKPOINT:
-                    nextState.phase = Phase.PREPARE;
+                    switch(type)
+                    {
+                        case CheckpointType.INDEX_ONLY:
+                            nextState.phase = Phase.REST;
+                            break;
+                        case CheckpointType.FULL:
+                            nextState.phase = Phase.PREPARE;
+                            break;
+                    }
                     break;
                 case Phase.PREPARE:
                     nextState.phase = Phase.IN_PROGRESS;
@@ -690,6 +707,17 @@ namespace FASTER.core
             }
         }
 
+        private void WriteHybridLogCheckpointCompleteFile()
+        {
+            string completed_filename = directoryConfiguration.GetHybridLogCheckpointFolder(_hybridLogCheckpointToken);
+            completed_filename += Path.DirectorySeparatorChar + "completed.dat";
+            using (var file = new StreamWriter(completed_filename, false))
+            {
+                file.WriteLine();
+                file.Flush();
+            }
+        }
+
         private void WriteHybridLogContextInfo()
         {
             string filename = directoryConfiguration.GetHybridLogCheckpointContextFileName(_hybridLogCheckpointToken, prevThreadCtx.guid);
@@ -709,9 +737,18 @@ namespace FASTER.core
                 _indexCheckpoint.info.Write(file);
                 file.Flush();
             }
-
         }
 
+        private void WriteIndexCheckpointCompleteFile()
+        {
+            string completed_filename = directoryConfiguration.GetIndexCheckpointFolder(_indexCheckpointToken);
+            completed_filename += Path.DirectorySeparatorChar + "completed.dat";
+            using (var file = new StreamWriter(completed_filename, false))
+            {
+                file.WriteLine();
+                file.Flush();
+            }
+        }
         private bool ObtainCurrentTailAddress(ref long location)
         {
             var tailAddress = hlog.GetTailAddress();

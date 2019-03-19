@@ -34,6 +34,7 @@ namespace FASTER.core
         internal IDevice objlogDevice;
         internal long resumeptr;
         internal long untilptr;
+        internal object frame;
 
         /// <summary>
         /// 
@@ -60,21 +61,16 @@ namespace FASTER.core
         /// </summary>
         public void Free()
         {
-            if (freeBuffer1.buffer != null)
+            if (freeBuffer1 != null)
             {
                 freeBuffer1.Return();
-                freeBuffer1.buffer = null;
+                freeBuffer1 = null;
             }
 
-            if (freeBuffer2.buffer != null)
+            if (freeBuffer2 != null)
             {
                 freeBuffer2.Return();
-                freeBuffer2.buffer = null;
-            }
-
-            if (handle != null)
-            {
-                handle.Signal();
+                freeBuffer2 = null;
             }
         }
     }
@@ -99,6 +95,7 @@ namespace FASTER.core
         public int count;
 
         internal bool partial;
+        internal long fromAddress;
         internal long untilAddress;
         internal CountdownEvent handle;
         internal IDevice objlogDevice;
@@ -131,11 +128,16 @@ namespace FASTER.core
         /// </summary>
         public void Free()
         {
-            if (freeBuffer1.buffer != null)
+            if (freeBuffer1 != null)
+            {
                 freeBuffer1.Return();
-            if (freeBuffer2.buffer != null)
+                freeBuffer1 = null;
+            }
+            if (freeBuffer2 != null)
+            {
                 freeBuffer2.Return();
-
+                freeBuffer2 = null;
+            }
             if (handle != null)
             {
                 handle.Signal();

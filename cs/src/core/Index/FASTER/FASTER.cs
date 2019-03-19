@@ -4,13 +4,7 @@
 #pragma warning disable 0162
 
 using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
-using System.Linq;
 using System.Runtime.CompilerServices;
-using System.Threading;
 
 namespace FASTER.core
 {
@@ -21,26 +15,29 @@ namespace FASTER.core
     {
         private readonly Functions functions;
         private readonly AllocatorBase<Key, Value> hlog;
+        private readonly AllocatorBase<Key, Value> readcache;
         private readonly IFasterEqualityComparer<Key> comparer;
 
+        private readonly bool UseReadCache = false;
         private readonly bool CopyReadsToTail = false;
         private readonly bool FoldOverSnapshot = false;
         private readonly int sectorSize;
 
         /// <summary>
-        /// Tail address of log
-        /// </summary>
-        public long LogTailAddress => hlog.GetTailAddress();
-
-        /// <summary>
-        /// Read-only address of log
-        /// </summary>
-        public long LogReadOnlyAddress => hlog.SafeReadOnlyAddress;
-
-        /// <summary>
         /// Number of used entries in hash index
         /// </summary>
         public long EntryCount => GetEntryCount();
+
+        /// <summary>
+        /// Hybrid log used by this FASTER instance
+        /// </summary>
+        public LogAccessor<Key, Value, Input, Output, Context> Log { get; }
+
+        /// <summary>
+        /// Read cache used by this FASTER instance
+        /// </summary>
+        public LogAccessor<Key, Value, Input, Output, Context> ReadCache { get; }
+
 
         private enum CheckpointType
         {
@@ -56,7 +53,9 @@ namespace FASTER.core
         private SystemState _systemState;
 
         private HybridLogCheckpointInfo _hybridLogCheckpoint;
-        private DirectoryConfiguration directoryConfiguration;
+        
+
+        private SafeConcurrentDictionary<Guid, long> _recoveredSessions;
 
         [ThreadStatic]
         private static FasterExecutionContext prevThreadCtx = default(FasterExecutionContext);
@@ -100,10 +99,47 @@ namespace FASTER.core
             CopyReadsToTail = logSettings.CopyReadsToTail;
             this.functions = functions;
 
-            if (Utility.IsBlittable<Key>() && Utility.IsBlittable<Value>() && serializerSettings?.keySerializer == null && serializerSettings?.valueSerializer == null)
+            if (logSettings.ReadCacheSettings != null)
+            {
+                CopyReadsToTail = false;
+                UseReadCache = true;
+            }
+
+            if (Utility.IsBlittable<Key>() && Utility.IsBlittable<Value>())
+            {
                 hlog = new BlittableAllocator<Key, Value>(logSettings, this.comparer);
+                Log = new LogAccessor<Key, Value, Input, Output, Context>(this, hlog);
+                if (UseReadCache)
+                {
+                    readcache = new BlittableAllocator<Key, Value>(
+                        new LogSettings {
+                            PageSizeBits = logSettings.ReadCacheSettings.PageSizeBits,
+                            MemorySizeBits = logSettings.ReadCacheSettings.MemorySizeBits,
+                            SegmentSizeBits = logSettings.ReadCacheSettings.MemorySizeBits,
+                            MutableFraction = logSettings.ReadCacheSettings.SecondChanceFraction
+                        }, this.comparer, ReadCacheEvict);
+                    readcache.Initialize();
+                    ReadCache = new LogAccessor<Key, Value, Input, Output, Context>(this, readcache);
+                }
+            }
             else
+            {
                 hlog = new GenericAllocator<Key, Value>(logSettings, serializerSettings, this.comparer);
+                Log = new LogAccessor<Key, Value, Input, Output, Context>(this, hlog);
+                if (UseReadCache)
+                {
+                    readcache = new GenericAllocator<Key, Value>(
+                        new LogSettings
+                        {
+                            PageSizeBits = logSettings.ReadCacheSettings.PageSizeBits,
+                            MemorySizeBits = logSettings.ReadCacheSettings.MemorySizeBits,
+                            SegmentSizeBits = logSettings.ReadCacheSettings.MemorySizeBits,
+                            MutableFraction = logSettings.ReadCacheSettings.SecondChanceFraction
+                        }, serializerSettings, this.comparer, ReadCacheEvict);
+                    readcache.Initialize();
+                    ReadCache = new LogAccessor<Key, Value, Input, Output, Context>(this, readcache);
+                }
+            }
 
             hlog.Initialize();
 
@@ -172,6 +208,14 @@ namespace FASTER.core
                 token = default(Guid);
             }
             return success;
+        }
+
+        /// <summary>
+        /// Recover from the latest checkpoints
+        /// </summary>
+        public void Recover()
+        {
+            InternalRecoverFromLatestCheckpoints();
         }
 
         /// <summary>
@@ -247,15 +291,34 @@ namespace FASTER.core
         /// <returns></returns>
         public bool CompleteCheckpoint(bool wait = false)
         {
-            do
+            if(threadCtx == null)
             {
-                CompletePending();
-                if (_systemState.phase == Phase.REST)
+                // the thread does not have an active session
+                // we can wait until system state becomes REST
+                do
+                {
+                    if(_systemState.phase == Phase.REST)
+                    {
+                        return true;
+                    }
+                } while (wait);
+            }
+            else
+            {
+                // the thread does has an active session and 
+                // so we need to constantly complete pending 
+                // and refresh (done inside CompletePending)
+                // for the checkpoint to be proceed
+                do
                 {
                     CompletePending();
-                    return true;
-                }
-            } while (wait);
+                    if (_systemState.phase == Phase.REST)
+                    {
+                        CompletePending();
+                        return true;
+                    }
+                } while (wait);
+            }
             return false;
         }
 
@@ -276,7 +339,6 @@ namespace FASTER.core
             var status = default(Status);
             if (internalStatus == OperationStatus.SUCCESS || internalStatus == OperationStatus.NOTFOUND)
             {
-
                 status = (Status)internalStatus;
             }
             else
@@ -341,12 +403,24 @@ namespace FASTER.core
         }
 
         /// <summary>
-        /// Truncate the log until, but not including, untilAddress
+        /// Delete hash entry if possible as a best effort
+        /// Entry is deleted if key is in memory and at the head of hash chain
+        /// Value is set to null (using ConcurrentWrite) if it is in mutable region
         /// </summary>
-        /// <param name="untilAddress"></param>
-        public bool ShiftBeginAddress(long untilAddress)
+        /// <param name="key"></param>
+        /// <param name="monotonicSerialNum"></param>
+        /// <returns></returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status DeleteFromMemory(ref Key key, long monotonicSerialNum)
         {
-            return InternalShiftBeginAddress(untilAddress);
+            var internalStatus = InternalDeleteFromMemory(ref key);
+            var status = default(Status);
+            if (internalStatus == OperationStatus.SUCCESS || internalStatus == OperationStatus.NOTFOUND)
+            {
+                status = (Status)internalStatus;
+            }
+            threadCtx.serialNum = monotonicSerialNum;
+            return status;
         }
 
         /// <summary>
@@ -363,9 +437,7 @@ namespace FASTER.core
         /// </summary>
         public void Dispose()
         {
-            MallocFixedPageSize<HashBucket>.Instance = null;
-            MallocFixedPageSize<HashBucket>.PhysicalInstance = null;
-            overflowBucketsAllocator = null;
+            base.Free();
             hlog.Dispose();
         }
     }

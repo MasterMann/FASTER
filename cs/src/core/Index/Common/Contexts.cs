@@ -102,7 +102,7 @@ namespace FASTER.core
 
     internal class DirectoryConfiguration
     {
-        private string checkpointDir;
+        private readonly string checkpointDir;
         public DirectoryConfiguration(string checkpointDir)
         {
             this.checkpointDir = checkpointDir;
@@ -116,8 +116,6 @@ namespace FASTER.core
 
         public const string cpr_base_folder = "cpr-checkpoints";
         public const string cpr_meta_file = "info";
-
-        public const string hlog_file = "lss.log";
 
         public void CreateIndexCheckpointFolder(Guid token)
         {
@@ -136,61 +134,102 @@ namespace FASTER.core
                 file.Delete();
         }
 
-        public string GetIndexCheckpointFolder(Guid token)
+        public string GetIndexCheckpointFolder(Guid token = default(Guid))
         {
-            return String.Format("{0}\\{1}\\{2}", checkpointDir, index_base_folder, token);
+            if (token != default(Guid))
+                return GetMergedFolderPath(checkpointDir, index_base_folder, token.ToString());
+            else
+                return GetMergedFolderPath(checkpointDir, index_base_folder);
         }
-        public string GetHybridLogCheckpointFolder(Guid token)
+
+        public string GetHybridLogCheckpointFolder(Guid token = default(Guid))
         {
-            return String.Format("{0}\\{1}\\{2}", checkpointDir, cpr_base_folder, token);
+            if (token != default(Guid))
+                return GetMergedFolderPath(checkpointDir, cpr_base_folder, token.ToString());
+            else
+                return GetMergedFolderPath(checkpointDir, cpr_base_folder);
         }
+
         public string GetIndexCheckpointMetaFileName(Guid token)
         {
-            return String.Format("{0}\\{1}\\{2}\\{3}.dat",
-                                    checkpointDir,
+            return GetMergedFolderPath(checkpointDir,
                                     index_base_folder,
-                                    token,
-                                    index_meta_file);
+                                    token.ToString(),
+                                    index_meta_file,
+                                    ".dat");
         }
+
         public string GetPrimaryHashTableFileName(Guid token)
         {
-            return String.Format("{0}\\{1}\\{2}\\{3}.dat",
-                                    checkpointDir,
+            return GetMergedFolderPath(checkpointDir,
                                     index_base_folder,
-                                    token,
-                                    hash_table_file);
+                                    token.ToString(),
+                                    hash_table_file,
+                                    ".dat");
         }
+
         public string GetOverflowBucketsFileName(Guid token)
         {
-            return String.Format("{0}\\{1}\\{2}\\{3}.dat",
-                                    checkpointDir,
+            return GetMergedFolderPath(checkpointDir,
                                     index_base_folder,
-                                    token,
-                                    overflow_buckets_file);
+                                    token.ToString(),
+                                    overflow_buckets_file,
+                                    ".dat");
         }
+
         public string GetHybridLogCheckpointMetaFileName(Guid token)
         {
-            return String.Format("{0}\\{1}\\{2}\\{3}.dat",
-                                    checkpointDir,
+            return GetMergedFolderPath(checkpointDir,
                                     cpr_base_folder,
-                                    token,
-                                    cpr_meta_file);
+                                    token.ToString(),
+                                    cpr_meta_file,
+                                    ".dat");
         }
+
         public string GetHybridLogCheckpointContextFileName(Guid checkpointToken, Guid sessionToken)
         {
-            return String.Format("{0}\\{1}\\{2}\\{3}.dat",
-                                    checkpointDir,
+            return GetMergedFolderPath(checkpointDir,
                                     cpr_base_folder,
-                                    checkpointToken,
-                                    sessionToken);
+                                    checkpointToken.ToString(),
+                                    sessionToken.ToString(),
+                                    ".dat");
         }
+
         public string GetHybridLogCheckpointFileName(Guid token)
         {
-            return String.Format("{0}\\{1}\\{2}\\{3}.dat",
-                                    checkpointDir,
+            return GetMergedFolderPath(checkpointDir,
                                     cpr_base_folder,
-                                    token,
-                                    snapshot_file);
+                                    token.ToString(),
+                                    snapshot_file,
+                                    ".dat");
+        }
+
+        public string GetHybridLogObjectCheckpointFileName(Guid token)
+        {
+            return GetMergedFolderPath(checkpointDir,
+                                    cpr_base_folder,
+                                    token.ToString(),
+                                    snapshot_file,
+                                    ".obj.dat");
+        }
+
+        public static string GetMergedFolderPath(params String[] paths)
+        {
+            String fullPath = paths[0];
+
+            for (int i = 1; i < paths.Length; i++)
+            {
+                if (i == paths.Length - 1 && paths[i].Contains("."))
+                {
+                    fullPath += paths[i];
+                }
+                else
+                {
+                    fullPath += Path.DirectorySeparatorChar + paths[i];
+                }
+            }
+
+            return fullPath;
         }
     }
 
@@ -254,7 +293,7 @@ namespace FASTER.core
             flushedLogicalAddress = 0;
             startLogicalAddress = 0;
             finalLogicalAddress = 0;
-            guids = new Guid[LightEpoch.kTableSize+1];
+            guids = new Guid[LightEpoch.kTableSize + 1];
             continueTokens = new Dictionary<Guid, long>();
             objectLogSegmentOffsets = null;
         }
@@ -346,7 +385,7 @@ namespace FASTER.core
                 }
             }
 
-            if(continueTokens.Count == num_threads)
+            if (continueTokens.Count == num_threads)
             {
                 return true;
             }
@@ -377,7 +416,7 @@ namespace FASTER.core
             writer.WriteLine(startLogicalAddress);
             writer.WriteLine(finalLogicalAddress);
             writer.WriteLine(numThreads);
-            for(int i = 0; i < numThreads; i++)
+            for (int i = 0; i < numThreads; i++)
             {
                 writer.WriteLine(guids[i]);
             }
@@ -390,6 +429,25 @@ namespace FASTER.core
                 {
                     writer.WriteLine(objectLogSegmentOffsets[i]);
                 }
+            }
+        }
+
+        /// <summary>
+        /// Print checkpoint info for debugging purposes
+        /// </summary>
+        public void DebugPrint()
+        {
+            Debug.WriteLine("******** HybridLog Checkpoint Info for {0} ********", guid);
+            Debug.WriteLine("Version: {0}", version);
+            Debug.WriteLine("Is Snapshot?: {0}", useSnapshotFile == 1);
+            Debug.WriteLine("Flushed LogicalAddress: {0}", flushedLogicalAddress);
+            Debug.WriteLine("Start Logical Address: {0}", startLogicalAddress);
+            Debug.WriteLine("Final Logical Address: {0}", finalLogicalAddress);
+            Debug.WriteLine("Num sessions recovered: {0}", numThreads);
+            Debug.WriteLine("Recovered sessions: ");
+            foreach (var sessionInfo in continueTokens)
+            {
+                Debug.WriteLine("{0}: {1}", sessionInfo.Key, sessionInfo.Value);
             }
         }
     }
@@ -482,6 +540,16 @@ namespace FASTER.core
             writer.WriteLine(num_buckets);
             writer.WriteLine(startLogicalAddress);
             writer.WriteLine(finalLogicalAddress);
+        }
+        public void DebugPrint()
+        {
+            Debug.WriteLine("******** Index Checkpoint Info for {0} ********", token);
+            Debug.WriteLine("Table Size: {0}", table_size);
+            Debug.WriteLine("Main Table Size (in GB): {0}", ((double)num_ht_bytes) / 1000.0 / 1000.0 / 1000.0);
+            Debug.WriteLine("Overflow Table Size (in GB): {0}", ((double)num_ofb_bytes) / 1000.0 / 1000.0 / 1000.0);
+            Debug.WriteLine("Num Buckets: {0}", num_buckets);
+            Debug.WriteLine("Start Logical Address: {0}", startLogicalAddress);
+            Debug.WriteLine("Final Logical Address: {0}", finalLogicalAddress);
         }
         public void Reset()
         {

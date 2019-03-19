@@ -7,7 +7,6 @@ Table of Contents
 -----------
 * [Getting FASTER](#getting-faster)
 * [Basic Concepts](#basic-concepts)
-* [Features](#features)
 * [Quick End-to-End Sample](#quick-end-to-end-sample)
 * [More Examples](#more-examples)
 * [Checkpointing and Recovery](#checkpointing-and-recovery)
@@ -33,11 +32,13 @@ FASTER supports three basic operations:
 
 Before instantiating FASTER, you need to create storage devices that FASTER will use. If you are using blittable types, you only need the hybrid log device. If you are also using objects, you need to create a separate object log device.
 
-```IDevice log = Devices.CreateLogDevice("C:\\Temp\\hybridlog_native.log");```
+```Csharp
+IDevice log = Devices.CreateLogDevice("C:\\Temp\\hybridlog_native.log");
+```
 
 Then, an instance of FASTER is created as follows:
 
-```
+```Csharp
 fht = new FasterKV<Key, Value, Input, Output, Empty, Functions>
   (1L << 20, new Functions(), new LogSettings { LogDevice = log });
 ```
@@ -93,7 +94,7 @@ When all threads are done operating on FASTER, you finally dispose the FASTER in
 Following is a simple end-to-end sample where all data is in memory, so we do not worry about pending 
 I/O operations. There is no checkpointing in this example as well.
 
-```
+```CSharp
 public static void Test()
 {
   var log = Devices.CreateLogDevice("C:\\Temp\\hlog.log");
@@ -116,7 +117,7 @@ public static void Test()
 
 Functions for this example:
 
-```
+```CSharp
 public class Funcs : IFunctions<long, long, long, long, Empty>
 {
   public void SingleReader(ref long key, ref long input, ref long value, ref long dst) => dst = value;
@@ -139,6 +140,94 @@ Several example projects are located in [cs/playground](https://github.com/Micro
 
 ## Checkpointing and Recovery
 
-FASTER supports checkpoint-based recovery. Recall that each FASTER threads start a session, associated with a unique Guid. All FASTER thread operations (Read, Upsert, RMW) carry a monotonic sequence number. At any point in time, one may call `Checkpoint` to initiate an asynchronous checkpoint of FASTER. After calling `Checkpoint`, each FASTER thread is (eventually) notified of a sequence number, such that all operations until, and no operations after, that sequence number, are guaranteed to be persisted as part of that checkpoint. During recovery, threads continue their session with the same Guid using `ContinueSession`, and are provided the thread-local sequence number until which that session hash been recovered. The new thread may use this information to replay all uncommitted operations since that point.
+FASTER supports **checkpoint-based recovery**. Every new checkpoint persists (or makes durable) additional user-operations (Read, Upsert or RMW). FASTER allows client threads to keep track of operations that have persisted and those that have not using a session-based API. 
 
-FASTER supports two notions of checkpointing: Snapshot and Fold-Over. The former is a full snapshot of in-memory into a separate snapshot file, whereas the latter is an incremental checkpoint of the changes since the last checkpoint. Fold-Over effectively moves the read-only marker of the hybrid log to the tail, and thus all the data is persisted as part of the same hybrid log (there is no separate snapshot file). All subsequent updates are written to new hybrid log tail locations, which gives it its incremental nature. You can find checkpointing examples [here](https://github.com/Microsoft/FASTER/blob/master/cs/test/SimpleRecoveryTest.cs) and [here](https://github.com/Microsoft/FASTER/tree/master/cs/playground/SumStore).
+Recall that each FASTER threads starts a session, associated with a unique Guid.
+All FASTER thread operations (Read, Upsert, RMW) carry a monotonic sequence number.
+At any point in time, one may call `Checkpoint` to initiate an asynchronous checkpoint of FASTER.
+After calling `Checkpoint`, each FASTER thread is (eventually) notified of a sequence number, such that all operations until, and no operations after, that sequence number, are guaranteed to be persisted as part of that checkpoint. 
+This sequence number can be used by the FASTER thread to clear any in-memory buffer of operations waiting to be performed.
+
+During recovery, threads can continue their session with the same Guid using `ContinueSession`. The function returns the thread-local sequence number until which that session hash been recovered. The new thread may use this information to replay all uncommitted operations since that point.
+
+Below, we show a simple recovery example for a single thread. 
+```Csharp
+public class PersistenceExample 
+{
+  private FasterKV<long, long, long, long, Empty, Funcs> fht;
+  private IDevice log;
+  
+  public PersistenceExample() 
+  {
+    log = Devices.CreateLogDevice("C:\\Temp\\hlog.log");
+    fht = new FasterKV<long, long, long, long, Empty, Funcs>
+    (1L << 20, new Funcs(), new LogSettings { LogDevice = log });
+  }
+  
+  public void Run()
+  {
+    IssuePeriodicCheckpoints();
+    RunSession();
+  }
+  
+  public void Continue()
+  {
+    fht.Recover();
+    IssuePeriodicCheckpoints();
+    ContinueSession();
+  }
+  
+  /* Helper Functions */
+  private void RunSession() 
+  {
+    Guid guid = fht.StartSession();
+    System.IO.File.WriteAllText(@"C:\\Temp\\session1.txt", guid.ToString());
+    
+    long seq = 0; // sequence identifier
+    
+    long key = 1, input = 10;
+    while(true) 
+    {
+      key = (seq % 1L << 20);
+      fht.RMW(ref key, ref input, Empty.Default, seq);
+      seq++;
+    }
+    // fht.StopSession() - outside infinite loop
+  }
+  
+  private void ContinueSession() 
+  {
+    string guidText = System.IO.File.ReadAllText(@"C:\\Temp\session1.txt");
+    Guid sessionGuid = Guid.Parse(guidText);
+    
+    long seq = fht.ContinueSession(sessionGuid); // recovered seq identifier
+    seq++;
+    
+    long key = 1, input = 10;
+    while(true) 
+    {
+      key = (seq % 1L << 20);
+      fht.RMW(ref key, ref input, Empty.Default, seq);
+      seq++;
+    }
+  }
+  
+  private void IssuePeriodicCheckpoints()
+  {
+    var t = new Thread(() => 
+    {
+      while(true) 
+      {
+        Thread.Sleep(10000);
+		fht.StartSession();
+        fht.TakeCheckpoint(out Guid token);
+        fht.CompleteCheckpoint(token, true);
+		fht.StopSession();
+      }
+    });
+    t.Start();
+  }
+}
+```
+
+FASTER supports two notions of checkpointing: Snapshot and Fold-Over. The former is a full snapshot of in-memory into a separate snapshot file, whereas the latter is an _incremental_ checkpoint of the changes since the last checkpoint. Fold-Over effectively moves the read-only marker of the hybrid log to the tail, and thus all the data is persisted as part of the same hybrid log (there is no separate snapshot file). All subsequent updates are written to new hybrid log tail locations, which gives Fold-Over its incremental nature. You can find a few basic checkpointing examples [here](https://github.com/Microsoft/FASTER/blob/master/cs/test/SimpleRecoveryTest.cs) and [here](https://github.com/Microsoft/FASTER/tree/master/cs/playground/SumStore). We plan to add more examples and details going forward.

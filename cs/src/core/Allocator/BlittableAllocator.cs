@@ -31,8 +31,8 @@ namespace FASTER.core
         private static readonly int keySize = Utility.GetSize(default(Key));
         private static readonly int valueSize = Utility.GetSize(default(Value));
 
-        public BlittableAllocator(LogSettings settings, IFasterEqualityComparer<Key> comparer)
-            : base(settings, comparer)
+        public BlittableAllocator(LogSettings settings, IFasterEqualityComparer<Key> comparer, Action<long, long> evictCallback = null)
+            : base(settings, comparer, evictCallback)
         {
             values = new byte[BufferSize][];
             handles = new GCHandle[BufferSize];
@@ -94,11 +94,14 @@ namespace FASTER.core
         /// </summary>
         public override void Dispose()
         {
-            for (int i = 0; i < values.Length; i++)
+            if (values != null)
             {
-                if (handles[i].IsAllocated)
-                    handles[i].Free();
-                values[i] = null;
+                for (int i = 0; i < values.Length; i++)
+                {
+                    if (handles[i].IsAllocated)
+                        handles[i].Free();
+                    values[i] = null;
+                }
             }
             handles = null;
             pointers = null;
@@ -161,7 +164,7 @@ namespace FASTER.core
         {
             WriteAsync((IntPtr)pointers[flushPage % BufferSize],
                     (ulong)(AlignedPageSizeBytes * flushPage),
-                    (uint)PageSize,
+                    (uint)AlignedPageSizeBytes,
                     callback,
                     asyncResult, device);
         }
@@ -192,17 +195,49 @@ namespace FASTER.core
         }
 
 
-        protected override void ClearPage(int page, bool pageZero)
+        protected override void ClearPage(long page)
         {
-            Array.Clear(values[page], 0, values[page].Length);
+            Array.Clear(values[page % BufferSize], 0, values[page % BufferSize].Length);
         }
+
+        /// <summary>
+        /// Delete in-memory portion of the log
+        /// </summary>
+        internal override void DeleteFromMemory()
+        {
+            for (int i = 0; i < values.Length; i++)
+            {
+                if (handles[i].IsAllocated)
+                    handles[i].Free();
+                values[i] = null;
+            }
+            handles = null;
+            pointers = null;
+            values = null;
+        }
+
 
         private void WriteAsync<TContext>(IntPtr alignedSourceAddress, ulong alignedDestinationAddress, uint numBytesToWrite,
                         IOCompletionCallback callback, PageAsyncFlushResult<TContext> asyncResult,
                         IDevice device)
         {
-            device.WriteAsync(alignedSourceAddress, alignedDestinationAddress,
-                numBytesToWrite, callback, asyncResult);
+            if (asyncResult.partial)
+            {
+                // Write only required bytes within the page
+                int aligned_start = (int)((asyncResult.fromAddress - (asyncResult.page << LogPageSizeBits)));
+                aligned_start = (aligned_start / sectorSize) * sectorSize;
+
+                int aligned_end = (int)((asyncResult.untilAddress - (asyncResult.page << LogPageSizeBits)));
+                aligned_end = ((aligned_end + (sectorSize - 1)) & ~(sectorSize - 1));
+
+                numBytesToWrite = (uint)(aligned_end - aligned_start);
+                device.WriteAsync(alignedSourceAddress + aligned_start, alignedDestinationAddress + (ulong)aligned_start, numBytesToWrite, callback, asyncResult);
+            }
+            else
+            {
+                device.WriteAsync(alignedSourceAddress, alignedDestinationAddress,
+                    numBytesToWrite, callback, asyncResult);
+            }
         }
 
         protected override void ReadAsync<TContext>(
@@ -268,5 +303,81 @@ namespace FASTER.core
             throw new Exception("BlittableAllocator memory pages are sector aligned - use direct copy");
             // Buffer.MemoryCopy(src, (void*)pointers[destinationPage % BufferSize], required_bytes, required_bytes);
         }
+
+        /// <summary>
+        /// Iterator interface for scanning FASTER log
+        /// </summary>
+        /// <param name="beginAddress"></param>
+        /// <param name="endAddress"></param>
+        /// <param name="scanBufferingMode"></param>
+        /// <returns></returns>
+        public override IFasterScanIterator<Key, Value> Scan(long beginAddress, long endAddress, ScanBufferingMode scanBufferingMode)
+        {
+            return new BlittableScanIterator<Key, Value>(this, beginAddress, endAddress, scanBufferingMode);
+        }
+
+
+        /// <summary>
+        /// Read pages from specified device
+        /// </summary>
+        /// <typeparam name="TContext"></typeparam>
+        /// <param name="readPageStart"></param>
+        /// <param name="numPages"></param>
+        /// <param name="callback"></param>
+        /// <param name="context"></param>
+        /// <param name="frame"></param>
+        /// <param name="completed"></param>
+        /// <param name="devicePageOffset"></param>
+        /// <param name="device"></param>
+        /// <param name="objectLogDevice"></param>
+        internal void AsyncReadPagesFromDeviceToFrame<TContext>(
+                                        long readPageStart,
+                                        int numPages,
+                                        IOCompletionCallback callback,
+                                        TContext context,
+                                        BlittableFrame frame,
+                                        out CountdownEvent completed,
+                                        long devicePageOffset = 0,
+                                        IDevice device = null, IDevice objectLogDevice = null)
+        {
+            var usedDevice = device;
+            IDevice usedObjlogDevice = objectLogDevice;
+
+            if (device == null)
+            {
+                usedDevice = this.device;
+            }
+
+            completed = new CountdownEvent(numPages);
+            for (long readPage = readPageStart; readPage < (readPageStart + numPages); readPage++)
+            {
+                int pageIndex = (int)(readPage % frame.frameSize);
+                if (frame.frame[pageIndex] == null)
+                {
+                    frame.Allocate(pageIndex);
+                }
+                else
+                {
+                    frame.Clear(pageIndex);
+                }
+                var asyncResult = new PageAsyncReadResult<TContext>()
+                {
+                    page = readPage,
+                    context = context,
+                    handle = completed,
+                    count = 1,
+                    frame = frame
+                };
+
+                ulong offsetInFile = (ulong)(AlignedPageSizeBytes * readPage);
+
+                if (device != null)
+                    offsetInFile = (ulong)(AlignedPageSizeBytes * (readPage - devicePageOffset));
+
+                usedDevice.ReadAsync(offsetInFile, (IntPtr)frame.pointers[pageIndex], (uint)AlignedPageSizeBytes, callback, asyncResult);
+            }
+        }
     }
 }
+
+
